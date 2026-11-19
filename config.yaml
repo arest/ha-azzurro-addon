@@ -1,0 +1,33 @@
+name: Azzurro Inverter
+version: 0.1.0
+slug: azzurro_inverter
+description: Fetch Azzurro inverter telemetry and publish Home Assistant MQTT sensors.
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+startup: application
+boot: auto
+init: false
+services:
+  - mqtt:want
+options:
+  username: ""
+  password: ""
+  inverter: ""
+  update_interval: 5
+  mqtt_host: ""
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
+schema:
+  username: str
+  password: password
+  inverter: str
+  update_interval: int(1,60)
+  mqtt_host: str?
+  mqtt_port: port?
+  mqtt_username: str?
+  mqtt_password: password?
