@@ -24,6 +24,14 @@ Then use **Settings → Apps → App store → ⋮ → Reload**, install the app
 
 Install and start **Mosquitto broker**, then configure the MQTT integration from **Settings → Devices & services** with MQTT Discovery enabled. The app uses Supervisor MQTT service discovery automatically. Manual MQTT connection options are only required for an external broker.
 
+If you already installed the app, upgrade it from **Settings → Apps → App store**:
+
+1. Open **Azzurro Inverter**.
+2. Click **Update** (or **Rebuild**) when available.
+3. Start the app again.
+
+For Git repositories, run **App store → ⋮ → Reload** first.
+
 Configure the required options as follows:
 
 ```yaml
@@ -32,6 +40,13 @@ password: your-azzurro-password
 inverter: your-inverter-serial
 update_interval: 5
 firebase_api_key: ""
+
+# Optional manual MQTT fallback settings
+mqtt_host: ""
+mqtt_port: 1883
+mqtt_ssl: false
+mqtt_username: ""
+mqtt_password: ""
 ```
 
 The interval is in minutes and must be between 1 and 60.
@@ -41,6 +56,8 @@ The interval is in minutes and must be between 1 and 60.
 Credentials are stored by Home Assistant in the app options and are passed to the container through `/data/options.json`.
 
 The app requires MQTT. It first asks Supervisor for the MQTT service details. If Supervisor service discovery is unavailable, configure the manual MQTT options.
+
+For manual MQTT fallback, set `mqtt_ssl: true` for TLS brokers (for example port `8883`) or keep it `false` for non-TLS brokers (usually `1883`).
 
 Telemetry is published with retained MQTT Discovery configuration under:
 
