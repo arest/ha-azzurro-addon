@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import ssl
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -140,7 +141,7 @@ async def mqtt_config(session: aiohttp.ClientSession, options: dict[str, Any]) -
         "port": int(options.get("mqtt_port", 1883)),
         "username": options.get("mqtt_username") or None,
         "password": options.get("mqtt_password") or None,
-        "ssl": False,
+        "ssl": bool(options.get("mqtt_ssl", False)),
     }
 
 
@@ -198,10 +199,13 @@ async def run(options: dict[str, Any]) -> None:
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         broker = await mqtt_config(session, options)
+        tls_context = ssl.create_default_context() if broker.get("ssl", False) else None
         async with MqttClient(
-            hostname=broker["host"], port=int(broker["port"]),
-            username=broker.get("username"), password=broker.get("password"),
-            tls=bool(broker.get("ssl", False)),
+            hostname=broker["host"],
+            port=int(broker["port"]),
+            username=broker.get("username"),
+            password=broker.get("password"),
+            tls_context=tls_context,
             will=Will(f"{prefix}/availability", payload="offline", retain=True),
         ) as mqtt:
             await publish_discovery(mqtt, inverter, prefix)

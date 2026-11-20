@@ -34,6 +34,16 @@ This app logs in to the Azzurro/Solarman cloud service, fetches inverter telemet
 4. Install **Azzurro Inverter** from the **Local apps** section.
 5. Configure it and start it as described below.
 
+### Upgrade an existing installation
+
+If you already installed the app, upgrade it from **Settings → Apps → App store**:
+
+1. Open the **Azzurro Inverter** app page.
+2. Click **Update** (or **Rebuild**) when a new version is available.
+3. Start the app again and check the **Log** tab.
+
+If you installed from a Git repository, open **App store → ⋮ → Reload** first so Home Assistant refreshes the repository metadata.
+
 ### Configure the app
 
 Set these required options:
@@ -45,13 +55,25 @@ inverter: ZH1025006KE241210086
 update_interval: 5
 # Optional override; leave empty to use built-in default
 firebase_api_key: ""
+
+# Optional manual MQTT settings (only when Supervisor MQTT discovery is unavailable)
+mqtt_host: ""
+mqtt_port: 1883
+mqtt_ssl: false
+mqtt_username: ""
+mqtt_password: ""
 ```
 
 `update_interval` is expressed in minutes and accepts values from 1 to 60.
 
 `firebase_api_key` is optional. Leave it empty unless Azzurro changes the Firebase key and you need to override it without rebuilding.
 
-The app obtains MQTT connection details automatically from Supervisor service discovery. The `mqtt_host`, `mqtt_port`, `mqtt_username`, and `mqtt_password` options are only needed when using a broker that is not managed by Supervisor.
+The app obtains MQTT connection details automatically from Supervisor service discovery. The manual `mqtt_*` options are only needed when using a broker that is not managed by Supervisor.
+
+When using manual MQTT settings:
+
+- set `mqtt_ssl: true` for TLS brokers (for example port `8883`)
+- keep `mqtt_ssl: false` for plain MQTT (usually port `1883`)
 
 ### Configure MQTT
 
