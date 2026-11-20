@@ -43,9 +43,13 @@ username: your-azzurro-email
 password: your-azzurro-password
 inverter: ZH1025006KE241210086
 update_interval: 5
+# Optional override; leave empty to use built-in default
+firebase_api_key: ""
 ```
 
 `update_interval` is expressed in minutes and accepts values from 1 to 60.
+
+`firebase_api_key` is optional. Leave it empty unless Azzurro changes the Firebase key and you need to override it without rebuilding.
 
 The app obtains MQTT connection details automatically from Supervisor service discovery. The `mqtt_host`, `mqtt_port`, `mqtt_username`, and `mqtt_password` options are only needed when using a broker that is not managed by Supervisor.
 

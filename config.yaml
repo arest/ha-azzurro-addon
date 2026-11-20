@@ -18,6 +18,7 @@ options:
   password: ""
   inverter: ""
   update_interval: 5
+  firebase_api_key: ""
   mqtt_host: ""
   mqtt_port: 1883
   mqtt_username: ""
@@ -27,6 +28,7 @@ schema:
   password: password
   inverter: str
   update_interval: int(1,60)
+  firebase_api_key: str?
   mqtt_host: str?
   mqtt_port: port?
   mqtt_username: str?
