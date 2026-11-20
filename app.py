@@ -15,7 +15,11 @@ from aiomqtt import Client as MqttClient, Will
 
 _LOGGER = logging.getLogger("azzurro_inverter")
 
-FIREBASE_API_KEY = "AIzaSyCTFwAoDwQaUWFhMEHeqUDw-rvu65vuX_0"
+# Firebase Web API key embedded in the Azzurro/Solarman clients. It is the
+# `?key=` parameter of the original login URL in azzurro.py / azzurro_login.py.
+# This is a public project identifier, not a user secret: it cannot read or
+# write account data on its own, and the per-user password is still required.
+DEFAULT_FIREBASE_API_KEY = "AIzaSyCTFwAoDwQaUWFhMEHeqUDw-rvu65vuX_0"
 IDENTITY_URL = "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword"
 REFRESH_URL = "https://securetoken.googleapis.com/v1/token"
 GRAPHQL_URL = "https://yyhpek4qzrg25gh56dg4w3pnou.appsync-api.eu-west-1.amazonaws.com/graphql"
@@ -29,10 +33,11 @@ class Token:
 
 
 class AzzurroClient:
-    def __init__(self, username: str, password: str, inverter: str) -> None:
+    def __init__(self, username: str, password: str, inverter: str, firebase_api_key: str) -> None:
         self.username = username
         self.password = password
         self.inverter = inverter
+        self.firebase_api_key = firebase_api_key
         self.token: Token | None = None
 
     async def login(self, session: aiohttp.ClientSession) -> None:
@@ -41,7 +46,7 @@ class AzzurroClient:
             "email": self.username,
             "password": self.password,
         }
-        async with session.post(IDENTITY_URL, params={"key": FIREBASE_API_KEY}, json=payload) as response:
+        async with session.post(IDENTITY_URL, params={"key": self.firebase_api_key}, json=payload) as response:
             body = await response.json(content_type=None)
             if response.status != 200:
                 raise RuntimeError(f"Azzurro login failed with HTTP {response.status}: {body.get('error', body)}")
@@ -53,7 +58,7 @@ class AzzurroClient:
             await self.login(session)
             return
         payload = {"grant_type": "refresh_token", "refresh_token": self.token.refresh_token}
-        async with session.post(REFRESH_URL, params={"key": FIREBASE_API_KEY}, data=payload) as response:
+        async with session.post(REFRESH_URL, params={"key": self.firebase_api_key}, data=payload) as response:
             body = await response.json(content_type=None)
             if response.status != 200:
                 _LOGGER.warning("Azzurro token refresh failed; performing a new login")
@@ -76,6 +81,9 @@ class AzzurroClient:
     async def fetch(self, session: aiohttp.ClientSession) -> dict[str, Any]:
         if not self.token or self.token.expires_at - time.time() < 120:
             await self.refresh(session)
+        token = self.token
+        if token is None:
+            raise RuntimeError("Azzurro login produced no token")
 
         query = """query ($serial: String!) {
           inverter: getLastAggregate(serial: $serial, series: DAY, type: \"Solarman\") {
@@ -84,11 +92,14 @@ class AzzurroClient:
           }
         }"""
         payload = {"operationName": None, "variables": {"serial": self.inverter}, "query": query}
-        headers = {"Authorization": self.token.id_token}
+        headers = {"Authorization": token.id_token}
         async with session.post(GRAPHQL_URL, headers=headers, json=payload) as response:
             if response.status == 401:
                 await self.refresh(session)
-                headers["Authorization"] = self.token.id_token
+                refreshed = self.token
+                if refreshed is None:
+                    raise RuntimeError("Azzurro token refresh produced no token")
+                headers["Authorization"] = refreshed.id_token
                 async with session.post(GRAPHQL_URL, headers=headers, json=payload) as retry:
                     return await self._parse_response(retry)
             return await self._parse_response(response)
@@ -181,7 +192,8 @@ async def run(options: dict[str, Any]) -> None:
     interval = int(options.get("update_interval", 5)) * 60
     inverter = options["inverter"]
     prefix = f"azzurro/{inverter}"
-    azzurro = AzzurroClient(options["username"], options["password"], inverter)
+    firebase_api_key = options.get("firebase_api_key") or DEFAULT_FIREBASE_API_KEY
+    azzurro = AzzurroClient(options["username"], options["password"], inverter, firebase_api_key)
     timeout = aiohttp.ClientTimeout(total=30)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:

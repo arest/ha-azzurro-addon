@@ -31,9 +31,12 @@ username: your-azzurro-email
 password: your-azzurro-password
 inverter: your-inverter-serial
 update_interval: 5
+firebase_api_key: ""
 ```
 
 The interval is in minutes and must be between 1 and 60.
+
+`firebase_api_key` is optional. Keep it empty to use the bundled default key; set it only if Azzurro changes their Firebase key.
 
 Credentials are stored by Home Assistant in the app options and are passed to the container through `/data/options.json`.
 
