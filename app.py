@@ -12,9 +12,17 @@ from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
-from aiomqtt import Client as MqttClient, Will
+from aiomqtt import Client as MqttClient, MqttError, Will
 
 _LOGGER = logging.getLogger("azzurro_inverter")
+
+APP_VERSION = "0.2.0"
+LOG_LEVELS = {"debug": logging.DEBUG, "info": logging.INFO}
+DEFAULT_DISCOVERY_PREFIX = "homeassistant"
+# Retained discovery configs survive a broker/HA restart, but they are lost if
+# the broker forgets retained messages. Refresh them at a low cadence, plus on
+# every reconnect, instead of on every telemetry poll.
+DISCOVERY_REFRESH_SECONDS = 3600
 
 # Firebase Web API key embedded in the Azzurro/Solarman clients. It is the
 # `?key=` parameter of the original login URL in azzurro.py / azzurro_login.py.
@@ -115,6 +123,17 @@ class AzzurroClient:
         return values[0]
 
 
+def log_broker(broker: dict[str, Any], source: str) -> None:
+    _LOGGER.info(
+        "MQTT broker (%s): %s:%s tls=%s username=%s",
+        source,
+        broker.get("host"),
+        broker.get("port"),
+        bool(broker.get("ssl", False)),
+        "set" if broker.get("username") else "none",
+    )
+
+
 async def mqtt_config(session: aiohttp.ClientSession, options: dict[str, Any]) -> dict[str, Any]:
     """Get MQTT details from Supervisor, with explicit manual configuration fallback."""
     manual_host = options.get("mqtt_host")
@@ -129,6 +148,7 @@ async def mqtt_config(session: aiohttp.ClientSession, options: dict[str, Any]) -
                     service = await response.json()
                     data = service.get("data", service)
                     if data.get("host") and data.get("port"):
+                        log_broker(data, "Supervisor service discovery")
                         return data
                 _LOGGER.warning("Supervisor MQTT service was unavailable; using manual MQTT options")
         except aiohttp.ClientError as error:
@@ -136,13 +156,15 @@ async def mqtt_config(session: aiohttp.ClientSession, options: dict[str, Any]) -
 
     if not manual_host:
         raise RuntimeError("No MQTT service found. Install/configure MQTT or set mqtt_host in the app options.")
-    return {
+    broker = {
         "host": manual_host,
         "port": int(options.get("mqtt_port", 1883)),
         "username": options.get("mqtt_username") or None,
         "password": options.get("mqtt_password") or None,
         "ssl": bool(options.get("mqtt_ssl", False)),
     }
+    log_broker(broker, "manual app options")
+    return broker
 
 
 SENSORS = {
@@ -155,7 +177,13 @@ SENSORS = {
 }
 
 
-async def publish_discovery(mqtt: MqttClient, inverter: str, prefix: str) -> None:
+async def publish_discovery(
+    mqtt: MqttClient,
+    inverter: str,
+    prefix: str,
+    discovery_prefix: str,
+    quiet: bool = False,
+) -> None:
     device = {"identifiers": [f"azzurro_{inverter}"], "name": f"Azzurro {inverter}", "manufacturer": "Azzurro", "model": "Inverter"}
     availability = f"{prefix}/availability"
     for key, definition in SENSORS.items():
@@ -171,13 +199,28 @@ async def publish_discovery(mqtt: MqttClient, inverter: str, prefix: str) -> Non
             "device_class": definition["device_class"],
             "state_class": definition["state_class"],
         }
-        await mqtt.publish(f"homeassistant/sensor/azzurro_{inverter}/{key}/config", json.dumps(config), retain=True)
+        topic = f"{discovery_prefix}/sensor/azzurro_{inverter}/{key}/config"
+        await mqtt.publish(topic, json.dumps(config), qos=1, retain=True)
+        _LOGGER.debug("Published discovery config %s: %s", topic, json.dumps(config))
+    if quiet:
+        _LOGGER.debug("Re-published %d MQTT discovery configs under %s/", len(SENSORS), discovery_prefix)
+    else:
+        _LOGGER.info(
+            "Published %d MQTT discovery configs under %s/sensor/azzurro_%s/ (device \"Azzurro %s\")",
+            len(SENSORS),
+            discovery_prefix,
+            inverter,
+            inverter,
+        )
 
 
-async def publish_values(mqtt: MqttClient, data: dict[str, Any], prefix: str) -> None:
+async def publish_values(mqtt: MqttClient, data: dict[str, Any], prefix: str) -> dict[str, float]:
+    published: dict[str, float] = {}
+    missing: set[str] = set()
     for key, definition in SENSORS.items():
         field = definition["field"]
         if field not in data or data[field] is None:
+            missing.add(field)
             continue
         value = float(data[field])
         if definition.get("absolute"):
@@ -186,40 +229,98 @@ async def publish_values(mqtt: MqttClient, data: dict[str, Any], prefix: str) ->
             value = abs(value) if value < 0 else 0
         elif definition.get("positive_absolute"):
             value = abs(value) if value >= 0 else 0
-        await mqtt.publish(f"{prefix}/{key}", str(round(value, 2)), retain=True)
+        value = round(value, 2)
+        await mqtt.publish(f"{prefix}/{key}", str(value), qos=1, retain=True)
+        _LOGGER.debug("Published %s/%s = %s (from %s=%s)", prefix, key, value, field, data[field])
+        published[key] = value
+    if missing:
+        _LOGGER.warning(
+            "Azzurro payload has no usable value for %s; %d of %d sensors were not updated",
+            ", ".join(sorted(missing)),
+            len(missing),
+            len(SENSORS),
+        )
+    return published
+
+
+async def mqtt_worker(
+    session: aiohttp.ClientSession,
+    broker: dict[str, Any],
+    azzurro: AzzurroClient,
+    inverter: str,
+    prefix: str,
+    discovery_prefix: str,
+    interval: int,
+) -> None:
+    tls_context = ssl.create_default_context() if broker.get("ssl", False) else None
+    async with MqttClient(
+        hostname=broker["host"],
+        port=int(broker["port"]),
+        username=broker.get("username") or None,
+        password=broker.get("password") or None,
+        tls_context=tls_context,
+        will=Will(f"{prefix}/availability", payload="offline", qos=1, retain=True),
+    ) as mqtt:
+        _LOGGER.info("Connected to MQTT broker %s:%s", broker["host"], broker["port"])
+        last_discovery = 0.0
+        while True:
+            if time.monotonic() - last_discovery >= DISCOVERY_REFRESH_SECONDS:
+                await publish_discovery(mqtt, inverter, prefix, discovery_prefix, quiet=last_discovery > 0)
+                last_discovery = time.monotonic()
+            await mqtt.publish(f"{prefix}/availability", "online", qos=1, retain=True)
+            try:
+                data = await azzurro.fetch(session)
+            except (aiohttp.ClientError, KeyError, RuntimeError, TypeError, ValueError) as error:
+                _LOGGER.error("Azzurro update failed: %s", error)
+                await mqtt.publish(f"{prefix}/availability", "offline", qos=1, retain=True)
+            else:
+                _LOGGER.debug(
+                    "Azzurro payload fields: %s",
+                    ", ".join(
+                        f"{name}={'null' if value is None else type(value).__name__}"
+                        for name, value in sorted(data.items())
+                    ),
+                )
+                published = await publish_values(mqtt, data, prefix)
+                if published:
+                    _LOGGER.info(
+                        "Fetched Azzurro inverter data: %s",
+                        ", ".join(f"{key}={value}" for key, value in published.items()),
+                    )
+                else:
+                    _LOGGER.error(
+                        "Fetched Azzurro inverter data but none of the expected fields (%s) were present",
+                        ", ".join(sorted({definition["field"] for definition in SENSORS.values()})),
+                    )
+            await asyncio.sleep(interval)
 
 
 async def run(options: dict[str, Any]) -> None:
     interval = int(options.get("update_interval", 5)) * 60
-    inverter = options["inverter"]
+    inverter = str(options["inverter"])
     prefix = f"azzurro/{inverter}"
+    discovery_prefix = str(options.get("discovery_prefix") or DEFAULT_DISCOVERY_PREFIX).strip("/")
     firebase_api_key = options.get("firebase_api_key") or DEFAULT_FIREBASE_API_KEY
     azzurro = AzzurroClient(options["username"], options["password"], inverter, firebase_api_key)
     timeout = aiohttp.ClientTimeout(total=30)
 
+    _LOGGER.info(
+        "Azzurro Inverter %s starting: inverter=%s poll=%d min discovery_prefix=%s state_prefix=%s",
+        APP_VERSION,
+        inverter,
+        interval // 60,
+        discovery_prefix,
+        prefix,
+    )
+
     async with aiohttp.ClientSession(timeout=timeout) as session:
         broker = await mqtt_config(session, options)
-        tls_context = ssl.create_default_context() if broker.get("ssl", False) else None
-        async with MqttClient(
-            hostname=broker["host"],
-            port=int(broker["port"]),
-            username=broker.get("username"),
-            password=broker.get("password"),
-            tls_context=tls_context,
-            will=Will(f"{prefix}/availability", payload="offline", retain=True),
-        ) as mqtt:
-            await publish_discovery(mqtt, inverter, prefix)
-            await mqtt.publish(f"{prefix}/availability", "online", retain=True)
-            while True:
-                try:
-                    data = await azzurro.fetch(session)
-                    await publish_values(mqtt, data, prefix)
-                    await mqtt.publish(f"{prefix}/availability", "online", retain=True)
-                    _LOGGER.info("Fetched Azzurro inverter data")
-                except (aiohttp.ClientError, KeyError, RuntimeError, TypeError, ValueError) as error:
-                    _LOGGER.error("Azzurro update failed: %s", error)
-                    await mqtt.publish(f"{prefix}/availability", "offline", retain=True)
-                await asyncio.sleep(interval)
+        while True:
+            try:
+                await mqtt_worker(session, broker, azzurro, inverter, prefix, discovery_prefix, interval)
+            except MqttError as error:
+                _LOGGER.error("MQTT connection lost or refused (%s); reconnecting in 30 seconds", error)
+                await asyncio.sleep(30)
 
 
 def load_options() -> dict[str, Any]:
@@ -232,5 +333,9 @@ def load_options() -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    asyncio.run(run(load_options()))
+    options = load_options()
+    level = LOG_LEVELS.get(str(options.get("log_level", "info")).lower(), logging.INFO)
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
+    if level == logging.DEBUG:
+        logging.getLogger("aiomqtt").setLevel(logging.DEBUG)
+    asyncio.run(run(options))

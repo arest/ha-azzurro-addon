@@ -55,6 +55,10 @@ inverter: ZH1025006KE241210086
 update_interval: 5
 # Optional override; leave empty to use built-in default
 firebase_api_key: ""
+# Must match the discovery prefix of your MQTT integration
+discovery_prefix: homeassistant
+# `debug` logs broker details, discovery topics, payloads and published values
+log_level: info
 
 # Optional manual MQTT settings (only when Supervisor MQTT discovery is unavailable)
 mqtt_host: ""
@@ -93,9 +97,18 @@ After the Azzurro app starts successfully, the sensors will be created automatic
 Open the Azzurro app's **Log** tab. A working installation should show messages similar to:
 
 ```text
+MQTT broker (Supervisor service discovery): core-mosquitto:1883 tls=False username=set
+Connected to MQTT broker core-mosquitto:1883
+Published 6 MQTT discovery configs under homeassistant/sensor/azzurro_ZH1025006KE241210086/ (device "Azzurro ZH1025006KE241210086")
 Azzurro authentication succeeded
-Fetched Azzurro inverter data
+Fetched Azzurro inverter data: battery_charge=87.4, solar_production=512.6, ...
 ```
+
+Those first three lines are what prove discovery reached the broker; the authentication and fetch lines only cover the cloud side. If discovery lines are missing, or the entities still do not appear, set `log_level: debug`, restart the app, and follow **Troubleshooting** in `DOCS.md`. The most common causes are:
+
+- the app publishing to a different broker than the one the Home Assistant MQTT integration uses
+- an MQTT integration discovery prefix other than `homeassistant`
+- MQTT Discovery being disabled in the MQTT integration
 
 If the app fails to connect, check the log for authentication or MQTT errors. Do not paste passwords, refresh tokens, or ID tokens into support requests.
 
