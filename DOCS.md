@@ -84,7 +84,7 @@ A failed poll marks the device unavailable rather than publishing zero values. T
    Compare it with the broker configured in **Settings → Devices & services → MQTT → Configure**. If the app publishes to a different broker (for example `core-mosquitto` while the MQTT integration points at an external broker), Home Assistant never sees the discovery messages. In that case set `mqtt_host`, `mqtt_port` and credentials explicitly and stop relying on Supervisor discovery.
 
 2. **Check the discovery line.**
-   `Published 6 MQTT discovery configs under homeassistant/sensor/azzurro_<serial>/`
+   `Published 25 MQTT discovery configs under homeassistant/sensor/azzurro_<serial>/`
    If this line is missing, the MQTT session failed before publishing; look for `MQTT connection lost or refused` or an authentication error in the MQTT broker log.
 
 3. **Check the value lines.**
@@ -101,7 +101,7 @@ A failed poll marks the device unavailable rather than publishing zero values. T
      -t 'homeassistant/sensor/azzurro_#' -v --retained-only
    ```
 
-   You should see six config payloads. If you do, the problem is on the Home Assistant side: confirm MQTT Discovery is enabled in the MQTT integration, check **Settings → Devices & services → MQTT**, and search the Home Assistant log for `mqtt` errors while restarting the app.
+   You should see 25 config payloads. If you do, the problem is on the Home Assistant side: confirm MQTT Discovery is enabled in the MQTT integration, check **Settings → Devices & services → MQTT**, and search the Home Assistant log for `mqtt` errors while restarting the app.
 
 5. **Check the discovery prefix.** If your MQTT integration uses a non-default discovery prefix, set `discovery_prefix` accordingly. A wrong prefix produces no error anywhere: the app publishes happily and Home Assistant ignores the topics.
 
