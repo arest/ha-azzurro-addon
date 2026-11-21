@@ -1,5 +1,5 @@
 name: Azzurro Inverter
-version: 0.2.0
+version: 0.3.0
 slug: azzurro_inverter
 description: Fetch Azzurro inverter telemetry and publish Home Assistant MQTT sensors.
 arch:

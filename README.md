@@ -99,7 +99,7 @@ Open the Azzurro app's **Log** tab. A working installation should show messages 
 ```text
 MQTT broker (Supervisor service discovery): core-mosquitto:1883 tls=False username=set
 Connected to MQTT broker core-mosquitto:1883
-Published 6 MQTT discovery configs under homeassistant/sensor/azzurro_ZH1025006KE241210086/ (device "Azzurro ZH1025006KE241210086")
+Published 25 MQTT discovery configs under homeassistant/sensor/azzurro_ZH1025006KE241210086/ (device "Azzurro ZH1025006KE241210086")
 Azzurro authentication succeeded
 Fetched Azzurro inverter data: battery_charge=87.4, solar_production=512.6, ...
 ```
@@ -114,16 +114,26 @@ If the app fails to connect, check the log for authentication or MQTT errors. Do
 
 ## Entities
 
-The app creates one `Azzurro <serial>` device and these sensors:
+The app creates one `Azzurro <serial>` device and publishes 25 sensors with units.
 
-- Battery charge (%)
-- Solar PV production (W)
-- Grid absorption (W; absolute value of `P_EXP`)
-- Home consumption (W)
-- Battery discharging (W)
-- Battery charging (W)
+Main sensors:
 
-The existing scripts use `P_EXP` as grid absorption and infer battery charge/discharge from the sign of `P_B_AGGR`; this app preserves that behavior. Verify the sign convention against the inverter during a known import/export and charge/discharge period before using these values for energy accounting.
+- Solar PV production (`P_SELF`, W)
+- Home consumption (`P_LOAD`, W)
+- Grid absorption (`P_EXP`, W; absolute value, legacy-compatible)
+- Grid import (`P_EXP`, W; only negative side, converted to positive)
+- Grid export (`P_EXP`, W; only positive side)
+- Battery charge (`BP1`, %)
+- Battery charging/discharging (`P_B_AGGR`, W)
+- PV string telemetry:
+  - `MP1`/`MP2` power (W)
+  - `MT1`/`MT2` voltage (V)
+  - `MC1`/`MC2` current (A)
+- Daily and lifetime energy (`EG1..EG6`, `ET1..ET6`, kWh, summed)
+- Inverter temperature (`TI`, °C)
+- Diagnostics: alerts, firmware, last sample timestamp
+
+Field semantics are based on live API validation (cross-checked against historic values and power balance), so units are now explicit in MQTT Discovery (`unit_of_measurement`).
 
 ## Authentication
 

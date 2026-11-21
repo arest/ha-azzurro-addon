@@ -9,14 +9,15 @@ import os
 import ssl
 import time
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Callable
 
 import aiohttp
 from aiomqtt import Client as MqttClient, MqttError, Will
 
 _LOGGER = logging.getLogger("azzurro_inverter")
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 LOG_LEVELS = {"debug": logging.DEBUG, "info": logging.INFO}
 DEFAULT_DISCOVERY_PREFIX = "homeassistant"
 # Retained discovery configs survive a broker/HA restart, but they are lost if
@@ -33,6 +34,16 @@ IDENTITY_URL = "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPas
 REFRESH_URL = "https://securetoken.googleapis.com/v1/token"
 GRAPHQL_URL = "https://yyhpek4qzrg25gh56dg4w3pnou.appsync-api.eu-west-1.amazonaws.com/graphql"
 
+QUERY = """query ($serial: String!) {
+  aggregate: getLastAggregate(serial: $serial, series: DAY, type: "Solarman") {
+    ALERTS BP1 BP1_MAX BP2 P_SELF P_LOAD P_EXT P_EXP P_B_AGGR P_B1 P_B2 P_DC_TOT
+    EG1 EG2 EG3 EG4 EG5 EG6 ET1 ET2 ET3 ET4 ET5 ET6 ARM DSPM DSPS TS
+  }
+  realtime: getInverterData(serial: $serial) {
+    BP1 BP2 P_B_AGGR P_DC_TOT P_LOAD MP1 MP2 MC1 MC2 MT1 MT2 TI TB TS
+  }
+}"""
+
 
 @dataclass
 class Token:
@@ -48,6 +59,7 @@ class AzzurroClient:
         self.inverter = inverter
         self.firebase_api_key = firebase_api_key
         self.token: Token | None = None
+        self.firmware: str | None = None
 
     async def login(self, session: aiohttp.ClientSession) -> None:
         payload = {
@@ -94,13 +106,7 @@ class AzzurroClient:
         if token is None:
             raise RuntimeError("Azzurro login produced no token")
 
-        query = """query ($serial: String!) {
-          inverter: getLastAggregate(serial: $serial, series: DAY, type: \"Solarman\") {
-            BP BP1 BP2 P_B1 P_B2 P_DC_TOT P_SELF P_B_AGGR P_EXT P_EXP P_LOAD
-            V EG1 EG2 EG3 EG4 EG5 EG6 ET1 ET2 ET3 ET4 ET5 ET6 TS SK __typename
-          }
-        }"""
-        payload = {"operationName": None, "variables": {"serial": self.inverter}, "query": query}
+        payload = {"operationName": None, "variables": {"serial": self.inverter}, "query": QUERY}
         headers = {"Authorization": token.id_token}
         async with session.post(GRAPHQL_URL, headers=headers, json=payload) as response:
             if response.status == 401:
@@ -116,11 +122,30 @@ class AzzurroClient:
     async def _parse_response(self, response: aiohttp.ClientResponse) -> dict[str, Any]:
         body = await response.json(content_type=None)
         if response.status != 200 or body.get("errors"):
-            raise RuntimeError(f"Azzurro data request failed with HTTP {response.status}")
-        values = body.get("data", {}).get("inverter")
+            detail = body.get("errors") or body
+            raise RuntimeError(f"Azzurro data request failed with HTTP {response.status}: {detail}")
+        data = body.get("data") or {}
+        values: dict[str, Any] = {}
+        # getLastAggregate returns a single-element list; getInverterData a plain object.
+        aggregate = data.get("aggregate")
+        if isinstance(aggregate, list):
+            for entry in aggregate:
+                if isinstance(entry, dict):
+                    values.update(entry)
+                    break
+        realtime = data.get("realtime")
+        if isinstance(realtime, dict):
+            # Prefer realtime values when present, but do not overwrite valid
+            # aggregate values with nulls.
+            for key, value in realtime.items():
+                if value is not None:
+                    values[key] = value
         if not values:
             raise RuntimeError("Azzurro response did not contain inverter data")
-        return values[0]
+        firmware = values.get("ARM")
+        if firmware:
+            self.firmware = str(firmware)
+        return values
 
 
 def log_broker(broker: dict[str, Any], source: str) -> None:
@@ -167,14 +192,371 @@ async def mqtt_config(session: aiohttp.ClientSession, options: dict[str, Any]) -
     return broker
 
 
-SENSORS = {
-    "battery_charge": {"name": "Battery charge", "unit": "%", "device_class": "battery", "state_class": "measurement", "field": "BP1"},
-    "solar_production": {"name": "Solar PV production", "unit": "W", "device_class": "power", "state_class": "measurement", "field": "P_SELF"},
-    "grid_absorption": {"name": "Grid absorption", "unit": "W", "device_class": "power", "state_class": "measurement", "field": "P_EXP", "absolute": True},
-    "home_consumption": {"name": "Home consumption", "unit": "W", "device_class": "power", "state_class": "measurement", "field": "P_LOAD"},
-    "battery_absorption": {"name": "Battery discharging", "unit": "W", "device_class": "power", "state_class": "measurement", "field": "P_B_AGGR", "negative_absolute": True},
-    "battery_charging": {"name": "Battery charging", "unit": "W", "device_class": "power", "state_class": "measurement", "field": "P_B_AGGR", "positive_absolute": True},
+# ---------------------------------------------------------------------------
+# Field reference (reverse-engineered from the Azzurro/Solarman cloud API)
+#
+#   MP1/MP2  PV string power                                  W
+#   MT1/MT2  PV string voltage                                V
+#   MC1/MC2  PV string current                                A
+#   TI       Inverter temperature                             °C
+#   TB       Battery temperature                              °C
+#   BP1      Battery state of charge                          %
+#   BP1_MAX  Highest state of charge reached today             %
+#   P_SELF   PV production power                              W
+#   P_LOAD   Home load power                                  W
+#   P_EXP    Grid power; negative = import, positive = export  W
+#   P_EXT    Unused by the API (always 0)                     W
+#   P_B1/2   Battery power per battery input                  W
+#   P_B_AGGR Battery power; positive = charging                W
+#   P_DC_TOT Total DC power                                   W
+#   EG1..6   Energy generated today, per channel              kWh
+#   ET1..6   Lifetime energy generated, per channel           kWh
+#   ALERTS   Comma-separated active alert codes               -
+#   ARM/DSPM/DSPS  Firmware revisions                         -
+#   TS       Timestamp of the sample                          epoch
+# ---------------------------------------------------------------------------
+
+NUMERIC = "number"
+TEXT = "text"
+TIMESTAMP = "timestamp"
+
+
+def _absolute(value: float) -> float:
+    return abs(value)
+
+
+def _positive(value: float) -> float:
+    """Keep only the positive part of a signed value."""
+    return value if value > 0 else 0.0
+
+
+def _grid_import(value: float) -> float:
+    """Azzurro reports grid power as negative while importing."""
+    return -value if value < 0 else 0.0
+
+
+def sensor(
+    name: str,
+    *,
+    field: str | None = None,
+    sum_of: tuple[str, ...] | None = None,
+    unit: str | None = None,
+    device_class: str | None = None,
+    state_class: str | None = None,
+    transform: Callable[[float], float] | None = None,
+    value_type: str = NUMERIC,
+    entity_category: str | None = None,
+    icon: str | None = None,
+    precision: int | None = None,
+    optional: bool = False,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "field": field,
+        "sum_of": sum_of,
+        "unit": unit,
+        "device_class": device_class,
+        "state_class": state_class,
+        "transform": transform,
+        "value_type": value_type,
+        "entity_category": entity_category,
+        "icon": icon,
+        "precision": precision,
+        "optional": optional,
+    }
+
+
+ENERGY_CHANNELS = ("EG1", "EG2", "EG3", "EG4", "EG5", "EG6")
+LIFETIME_CHANNELS = ("ET1", "ET2", "ET3", "ET4", "ET5", "ET6")
+
+SENSORS: dict[str, dict[str, Any]] = {
+    # --- Power flow -------------------------------------------------------
+    "solar_production": sensor(
+        "Solar PV production",
+        field="P_SELF",
+        unit="W",
+        device_class="power",
+        state_class="measurement",
+        icon="mdi:solar-power",
+        precision=0,
+    ),
+    "home_consumption": sensor(
+        "Home consumption",
+        field="P_LOAD",
+        unit="W",
+        device_class="power",
+        state_class="measurement",
+        icon="mdi:home-lightning-bolt",
+        precision=0,
+    ),
+    # Legacy sensor kept for backward compatibility with existing dashboards.
+    "grid_absorption": sensor(
+        "Grid absorption",
+        field="P_EXP",
+        unit="W",
+        device_class="power",
+        state_class="measurement",
+        transform=_absolute,
+        icon="mdi:transmission-tower",
+        precision=0,
+    ),
+    "grid_import": sensor(
+        "Grid import",
+        field="P_EXP",
+        unit="W",
+        device_class="power",
+        state_class="measurement",
+        transform=_grid_import,
+        icon="mdi:transmission-tower-import",
+        precision=0,
+    ),
+    "grid_export": sensor(
+        "Grid export",
+        field="P_EXP",
+        unit="W",
+        device_class="power",
+        state_class="measurement",
+        transform=_positive,
+        icon="mdi:transmission-tower-export",
+        precision=0,
+    ),
+    "dc_power": sensor(
+        "DC power",
+        field="P_DC_TOT",
+        unit="W",
+        device_class="power",
+        state_class="measurement",
+        icon="mdi:flash",
+        precision=0,
+        optional=True,
+    ),
+    # --- Battery ----------------------------------------------------------
+    "battery_charge": sensor(
+        "Battery charge",
+        field="BP1",
+        unit="%",
+        device_class="battery",
+        state_class="measurement",
+        icon="mdi:battery",
+        precision=0,
+    ),
+    "battery_charge_max_today": sensor(
+        "Battery charge today maximum",
+        field="BP1_MAX",
+        unit="%",
+        device_class="battery",
+        state_class="measurement",
+        icon="mdi:battery-plus-variant",
+        precision=0,
+        optional=True,
+    ),
+    "battery_charging": sensor(
+        "Battery charging",
+        field="P_B_AGGR",
+        unit="W",
+        device_class="power",
+        state_class="measurement",
+        transform=_positive,
+        icon="mdi:battery-charging",
+        precision=0,
+        optional=True,
+    ),
+    "battery_absorption": sensor(
+        "Battery discharging",
+        field="P_B_AGGR",
+        unit="W",
+        device_class="power",
+        state_class="measurement",
+        transform=_grid_import,
+        icon="mdi:battery-minus",
+        precision=0,
+        optional=True,
+    ),
+    "battery_power_1": sensor(
+        "Battery power input 1",
+        field="P_B1",
+        unit="W",
+        device_class="power",
+        state_class="measurement",
+        icon="mdi:battery-sync",
+        precision=0,
+        optional=True,
+    ),
+    "battery_power_2": sensor(
+        "Battery power input 2",
+        field="P_B2",
+        unit="W",
+        device_class="power",
+        state_class="measurement",
+        icon="mdi:battery-sync",
+        precision=0,
+        optional=True,
+    ),
+    "battery_temperature": sensor(
+        "Battery temperature",
+        field="TB",
+        unit="°C",
+        device_class="temperature",
+        state_class="measurement",
+        icon="mdi:thermometer",
+        precision=1,
+        optional=True,
+    ),
+    # --- PV strings -------------------------------------------------------
+    "pv1_power": sensor(
+        "PV string 1 power",
+        field="MP1",
+        unit="W",
+        device_class="power",
+        state_class="measurement",
+        icon="mdi:solar-panel",
+        precision=0,
+        optional=True,
+    ),
+    "pv1_voltage": sensor(
+        "PV string 1 voltage",
+        field="MT1",
+        unit="V",
+        device_class="voltage",
+        state_class="measurement",
+        icon="mdi:solar-panel",
+        precision=1,
+        optional=True,
+    ),
+    "pv1_current": sensor(
+        "PV string 1 current",
+        field="MC1",
+        unit="A",
+        device_class="current",
+        state_class="measurement",
+        icon="mdi:solar-panel",
+        precision=2,
+        optional=True,
+    ),
+    "pv2_power": sensor(
+        "PV string 2 power",
+        field="MP2",
+        unit="W",
+        device_class="power",
+        state_class="measurement",
+        icon="mdi:solar-panel",
+        precision=0,
+        optional=True,
+    ),
+    "pv2_voltage": sensor(
+        "PV string 2 voltage",
+        field="MT2",
+        unit="V",
+        device_class="voltage",
+        state_class="measurement",
+        icon="mdi:solar-panel",
+        precision=1,
+        optional=True,
+    ),
+    "pv2_current": sensor(
+        "PV string 2 current",
+        field="MC2",
+        unit="A",
+        device_class="current",
+        state_class="measurement",
+        icon="mdi:solar-panel",
+        precision=2,
+        optional=True,
+    ),
+    # --- Energy -----------------------------------------------------------
+    "energy_today": sensor(
+        "PV energy today",
+        sum_of=ENERGY_CHANNELS,
+        unit="kWh",
+        device_class="energy",
+        state_class="total_increasing",
+        icon="mdi:solar-power-variant",
+        precision=2,
+    ),
+    "energy_total": sensor(
+        "PV energy total",
+        sum_of=LIFETIME_CHANNELS,
+        unit="kWh",
+        device_class="energy",
+        state_class="total_increasing",
+        icon="mdi:solar-power-variant-outline",
+        precision=2,
+    ),
+    # --- Inverter ---------------------------------------------------------
+    "inverter_temperature": sensor(
+        "Inverter temperature",
+        field="TI",
+        unit="°C",
+        device_class="temperature",
+        state_class="measurement",
+        icon="mdi:thermometer",
+        precision=1,
+        optional=True,
+    ),
+    # --- Diagnostics ------------------------------------------------------
+    "alerts": sensor(
+        "Active alerts",
+        field="ALERTS",
+        value_type=TEXT,
+        entity_category="diagnostic",
+        icon="mdi:alert-outline",
+        optional=True,
+    ),
+    "firmware": sensor(
+        "Firmware",
+        field="ARM",
+        value_type=TEXT,
+        entity_category="diagnostic",
+        icon="mdi:chip",
+        optional=True,
+    ),
+    "last_sample": sensor(
+        "Last inverter sample",
+        field="TS",
+        value_type=TIMESTAMP,
+        entity_category="diagnostic",
+        icon="mdi:clock-outline",
+        optional=True,
+    ),
 }
+
+
+def _raw_value(definition: dict[str, Any], data: dict[str, Any]) -> Any:
+    sum_of = definition.get("sum_of")
+    if sum_of:
+        numbers = []
+        for field in sum_of:
+            value = data.get(field)
+            if value is None:
+                continue
+            numbers.append(float(value))
+        if not numbers:
+            return None
+        return sum(numbers)
+    return data.get(definition["field"])
+
+
+def _format_payload(definition: dict[str, Any], raw: Any) -> str | int | float | None:
+    value_type = definition["value_type"]
+    if value_type == TIMESTAMP:
+        try:
+            return datetime.fromtimestamp(float(raw), tz=timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            return None
+    if value_type == TEXT:
+        text = str(raw).strip()
+        return text or None
+    try:
+        number = float(raw)
+    except (TypeError, ValueError):
+        return None
+    transform = definition.get("transform")
+    if transform:
+        number = transform(number)
+    number = round(number, 2)
+    if number == 0:
+        number = 0.0
+    return number
 
 
 async def publish_discovery(
@@ -182,12 +564,20 @@ async def publish_discovery(
     inverter: str,
     prefix: str,
     discovery_prefix: str,
+    firmware: str | None = None,
     quiet: bool = False,
 ) -> None:
-    device = {"identifiers": [f"azzurro_{inverter}"], "name": f"Azzurro {inverter}", "manufacturer": "Azzurro", "model": "Inverter"}
+    device = {
+        "identifiers": [f"azzurro_{inverter}"],
+        "name": f"Azzurro {inverter}",
+        "manufacturer": "Azzurro",
+        "model": "Inverter",
+    }
+    if firmware:
+        device["sw_version"] = firmware
     availability = f"{prefix}/availability"
     for key, definition in SENSORS.items():
-        config = {
+        config: dict[str, Any] = {
             "name": definition["name"],
             "unique_id": f"azzurro_{inverter}_{key}",
             "state_topic": f"{prefix}/{key}",
@@ -195,10 +585,19 @@ async def publish_discovery(
             "payload_available": "online",
             "payload_not_available": "offline",
             "device": device,
-            "unit_of_measurement": definition["unit"],
-            "device_class": definition["device_class"],
-            "state_class": definition["state_class"],
         }
+        if definition.get("unit"):
+            config["unit_of_measurement"] = definition["unit"]
+        if definition.get("device_class"):
+            config["device_class"] = definition["device_class"]
+        if definition.get("state_class"):
+            config["state_class"] = definition["state_class"]
+        if definition.get("entity_category"):
+            config["entity_category"] = definition["entity_category"]
+        if definition.get("icon"):
+            config["icon"] = definition["icon"]
+        if definition.get("precision") is not None:
+            config["suggested_display_precision"] = definition["precision"]
         topic = f"{discovery_prefix}/sensor/azzurro_{inverter}/{key}/config"
         await mqtt.publish(topic, json.dumps(config), qos=1, retain=True)
         _LOGGER.debug("Published discovery config %s: %s", topic, json.dumps(config))
@@ -214,25 +613,19 @@ async def publish_discovery(
         )
 
 
-async def publish_values(mqtt: MqttClient, data: dict[str, Any], prefix: str) -> dict[str, float]:
-    published: dict[str, float] = {}
+async def publish_values(mqtt: MqttClient, data: dict[str, Any], prefix: str) -> dict[str, Any]:
+    published: dict[str, Any] = {}
     missing: set[str] = set()
     for key, definition in SENSORS.items():
-        field = definition["field"]
-        if field not in data or data[field] is None:
-            missing.add(field)
+        raw = _raw_value(definition, data)
+        payload = None if raw is None else _format_payload(definition, raw)
+        if payload is None:
+            if not definition.get("optional"):
+                missing.add(definition.get("field") or "+".join(definition.get("sum_of") or ()))
             continue
-        value = float(data[field])
-        if definition.get("absolute"):
-            value = abs(value)
-        elif definition.get("negative_absolute"):
-            value = abs(value) if value < 0 else 0
-        elif definition.get("positive_absolute"):
-            value = abs(value) if value >= 0 else 0
-        value = round(value, 2)
-        await mqtt.publish(f"{prefix}/{key}", str(value), qos=1, retain=True)
-        _LOGGER.debug("Published %s/%s = %s (from %s=%s)", prefix, key, value, field, data[field])
-        published[key] = value
+        await mqtt.publish(f"{prefix}/{key}", str(payload), qos=1, retain=True)
+        _LOGGER.debug("Published %s/%s = %s (unit=%s)", prefix, key, payload, definition.get("unit"))
+        published[key] = payload
     if missing:
         _LOGGER.warning(
             "Azzurro payload has no usable value for %s; %d of %d sensors were not updated",
@@ -265,7 +658,14 @@ async def mqtt_worker(
         last_discovery = 0.0
         while True:
             if time.monotonic() - last_discovery >= DISCOVERY_REFRESH_SECONDS:
-                await publish_discovery(mqtt, inverter, prefix, discovery_prefix, quiet=last_discovery > 0)
+                await publish_discovery(
+                    mqtt,
+                    inverter,
+                    prefix,
+                    discovery_prefix,
+                    firmware=azzurro.firmware,
+                    quiet=last_discovery > 0,
+                )
                 last_discovery = time.monotonic()
             await mqtt.publish(f"{prefix}/availability", "online", qos=1, retain=True)
             try:
@@ -290,7 +690,7 @@ async def mqtt_worker(
                 else:
                     _LOGGER.error(
                         "Fetched Azzurro inverter data but none of the expected fields (%s) were present",
-                        ", ".join(sorted({definition["field"] for definition in SENSORS.values()})),
+                        ", ".join(sorted({definition["field"] for definition in SENSORS.values() if definition.get("field")})),
                     )
             await asyncio.sleep(interval)
 
@@ -305,12 +705,13 @@ async def run(options: dict[str, Any]) -> None:
     timeout = aiohttp.ClientTimeout(total=30)
 
     _LOGGER.info(
-        "Azzurro Inverter %s starting: inverter=%s poll=%d min discovery_prefix=%s state_prefix=%s",
+        "Azzurro Inverter %s starting: inverter=%s poll=%d min discovery_prefix=%s state_prefix=%s sensors=%d",
         APP_VERSION,
         inverter,
         interval // 60,
         discovery_prefix,
         prefix,
+        len(SENSORS),
     )
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
